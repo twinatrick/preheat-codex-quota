@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex 額度預熱器"
+  short_description: "隨 OpenCode / Codex Server 自動掛載，於整點後一分及刷新後一分鐘內強制驗證 5 小時額度為 100% 時自動預熱。"
+  default_prompt: "請使用 $preheat-codex-quota 檢查當前 CLI 介面的自動掛載預熱狀態與五小時額度。"
+policy:
+  allow_implicit_invocation: false
