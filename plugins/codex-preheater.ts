@@ -1,5 +1,5 @@
 /**
- * Codex Quota Preheater — OpenCode Server Auto-Mount Plugin (v1.3.0)
+ * Codex Quota Preheater — OpenCode Server Auto-Mount Plugin (v1.4.0)
  *
  * 行為規範：
  * 1. 只要 OpenCode Server 啟動即自動掛載於背景，無需使用者手動呼叫。
@@ -7,20 +7,19 @@
  * 3. 若讀到 5 小時額度目前已使用（< 100% 剩餘）且有下次刷新時間（resetAtMs），
  *    自動排程在「下次刷新後 1 分鐘內」（+15 秒與 +45 秒雙重保底）觸發檢查並預熱。
  * 4. 所有計時器獨立追蹤於 Set 中，重新載入或停止時完整清除，絕不殘留孤兒計時器。
- * 5. 相容所有 OpenCode 環境（原生 auth.json、oc-codex-multi-auth 帳號檔、TUI 快照或 Codex app-server），
- *    不依賴任何第三方插件的內部 node_modules JS 檔案結構。
- * 6. 實際預熱透過 Python 核心腳本 `codex_preheater.py` 執行，強制在程式碼層級驗證 5h 剩餘 == 100%。
+ * 5. 相容所有 OpenCode 環境（原生 auth.json、oc-codex-multi-auth 帳號檔），
+ *    支援 OAuth Refresh Token 輪替（Token Rotation）原子回寫，不依賴任何過期磁碟快照。
+ * 6. 實際預熱透過 Python 核心腳本 `codex_preheater.py` 執行，發送前強制重新即時查詢並驗證 5h 剩餘 == 100%。
  */
 
 import { spawn } from "node:child_process"
-import { appendFile, mkdir, readFile, stat } from "node:fs/promises"
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
 const PLUGIN_ID = "codex-preheater-server"
 const FIVE_HOURS_MINUTES = 300
-const SNAPSHOT_MAX_AGE_MS = 90_000
-const DEFAULT_MODEL = "openai/gpt-6-luna"
+const DEFAULT_MODEL = "auto"
 
 const OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -55,6 +54,15 @@ interface OAuthCredential {
   expiresAtMs?: number
   accountId?: string
   organizationId?: string
+  sourcePath?: string
+  sourceKind?: "multi_auth" | "native_auth"
+  accountIndex?: number
+}
+
+interface RefreshedTokenResult {
+  accessToken: string
+  refreshToken?: string
+  expiresAtMs?: number
 }
 
 declare global {
@@ -123,7 +131,7 @@ function extractAccountIdFromToken(token: string): string | undefined {
   return undefined
 }
 
-async function refreshOpenAIOAuthToken(refreshToken: string): Promise<string | null> {
+async function refreshOpenAIOAuthToken(refreshToken: string): Promise<RefreshedTokenResult | null> {
   try {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
@@ -137,11 +145,105 @@ async function refreshOpenAIOAuthToken(refreshToken: string): Promise<string | n
     })
     if (!resp.ok) return null
     const data = (await resp.json()) as Record<string, unknown>
-    return typeof data.access_token === "string" && data.access_token.trim()
-      ? data.access_token.trim()
-      : null
+    if (typeof data.access_token !== "string" || !data.access_token.trim()) {
+      return null
+    }
+    const newRefresh =
+      typeof data.refresh_token === "string" && data.refresh_token.trim()
+        ? data.refresh_token.trim()
+        : refreshToken
+    const expiresIn = Number(data.expires_in)
+    const expiresAtMs =
+      Number.isFinite(expiresIn) && expiresIn > 0
+        ? Math.round(Date.now() + expiresIn * 1000)
+        : undefined
+    return {
+      accessToken: data.access_token.trim(),
+      refreshToken: newRefresh,
+      expiresAtMs,
+    }
   } catch {
     return null
+  }
+}
+
+async function persistRefreshedCredential(
+  cred: OAuthCredential,
+  refreshed: RefreshedTokenResult
+): Promise<void> {
+  if (!cred.sourcePath || !cred.sourceKind) return
+  let tempPath = ""
+  try {
+    const raw = await readFile(cred.sourcePath, "utf-8")
+    const data = JSON.parse(raw) as Record<string, unknown>
+    if (!data || typeof data !== "object") return
+    let updated = false
+
+    if (cred.sourceKind === "multi_auth") {
+      const accounts = Array.isArray(data.accounts) ? data.accounts : []
+      const idx = cred.accountIndex ?? -1
+      if (idx >= 0 && idx < accounts.length && accounts[idx] && typeof accounts[idx] === "object") {
+        const acc = accounts[idx] as Record<string, unknown>
+        if ("accessToken" in acc || !("access" in acc)) {
+          acc.accessToken = refreshed.accessToken
+        } else {
+          acc.access = refreshed.accessToken
+        }
+        if (refreshed.refreshToken) {
+          if ("refreshToken" in acc || !("refresh" in acc)) {
+            acc.refreshToken = refreshed.refreshToken
+          } else {
+            acc.refresh = refreshed.refreshToken
+          }
+        }
+        if (refreshed.expiresAtMs && refreshed.expiresAtMs > 0) {
+          if ("expiresAt" in acc || !("expires" in acc)) {
+            acc.expiresAt = refreshed.expiresAtMs
+          } else {
+            acc.expires = refreshed.expiresAtMs
+          }
+        }
+        updated = true
+      }
+    } else if (cred.sourceKind === "native_auth") {
+      const openai = data.openai as Record<string, unknown> | undefined
+      if (openai && typeof openai === "object" && openai.type === "oauth") {
+        if ("access" in openai || !("accessToken" in openai)) {
+          openai.access = refreshed.accessToken
+        } else {
+          openai.accessToken = refreshed.accessToken
+        }
+        if (refreshed.refreshToken) {
+          if ("refresh" in openai || !("refreshToken" in openai)) {
+            openai.refresh = refreshed.refreshToken
+          } else {
+            openai.refreshToken = refreshed.refreshToken
+          }
+        }
+        if (refreshed.expiresAtMs && refreshed.expiresAtMs > 0) {
+          if ("expires" in openai || !("expiresAt" in openai)) {
+            openai.expires = refreshed.expiresAtMs
+          } else {
+            openai.expiresAt = refreshed.expiresAtMs
+          }
+        }
+        updated = true
+      }
+    }
+
+    if (updated) {
+      tempPath = `${cred.sourcePath}.${process.pid}.${Date.now()}.tmp`
+      await writeFile(tempPath, JSON.stringify(data, null, 2), "utf-8")
+      await rename(tempPath, cred.sourcePath)
+    }
+  } catch {
+    if (tempPath) {
+      try {
+        await unlink(tempPath)
+      } catch {
+        // ignore cleanup error
+      }
+    }
   }
 }
 
@@ -216,6 +318,9 @@ async function discoverOpenCodeCredentials(): Promise<OAuthCredential[]> {
             : undefined,
           accountId: typeof acc.accountId === "string" ? acc.accountId : undefined,
           organizationId: typeof acc.organizationId === "string" ? acc.organizationId : undefined,
+          sourcePath: path,
+          sourceKind: "multi_auth",
+          accountIndex: activeIdx,
         })
         break
       }
@@ -247,6 +352,8 @@ async function discoverOpenCodeCredentials(): Promise<OAuthCredential[]> {
             : undefined,
           accountId: typeof openai.accountId === "string" ? openai.accountId : undefined,
           organizationId: typeof openai.organizationId === "string" ? openai.organizationId : undefined,
+          sourcePath: path,
+          sourceKind: "native_auth",
         })
         break
       }
@@ -260,13 +367,18 @@ async function discoverOpenCodeCredentials(): Promise<OAuthCredential[]> {
 
 async function fetchWhamUsageWithCredential(cred: OAuthCredential): Promise<LimitsPayload | null> {
   let token = cred.accessToken
+  let currentRefresh = cred.refreshToken
   const nowMs = Date.now()
   if (
     (!token || (cred.expiresAtMs && cred.expiresAtMs > 0 && cred.expiresAtMs <= nowMs + 30_000)) &&
-    cred.refreshToken
+    currentRefresh
   ) {
-    const refreshed = await refreshOpenAIOAuthToken(cred.refreshToken)
-    if (refreshed) token = refreshed
+    const refreshed = await refreshOpenAIOAuthToken(currentRefresh)
+    if (refreshed) {
+      token = refreshed.accessToken
+      currentRefresh = refreshed.refreshToken || currentRefresh
+      await persistRefreshedCredential(cred, refreshed)
+    }
   }
   if (!token) return null
 
@@ -287,11 +399,12 @@ async function fetchWhamUsageWithCredential(cred: OAuthCredential): Promise<Limi
 
   try {
     let resp = await doRequest(token)
-    if (resp.status === 401 && cred.refreshToken) {
-      const refreshed = await refreshOpenAIOAuthToken(cred.refreshToken)
+    if (resp.status === 401 && currentRefresh) {
+      const refreshed = await refreshOpenAIOAuthToken(currentRefresh)
       if (!refreshed) return null
-      resolvedAccountId = cred.accountId || extractAccountIdFromToken(refreshed)
-      resp = await doRequest(refreshed)
+      await persistRefreshedCredential(cred, refreshed)
+      resolvedAccountId = cred.accountId || extractAccountIdFromToken(refreshed.accessToken)
+      resp = await doRequest(refreshed.accessToken)
     }
     if (!resp.ok) return null
     const rawUsage = (await resp.json()) as Record<string, unknown>
@@ -321,27 +434,11 @@ async function fetchWhamUsageWithCredential(cred: OAuthCredential): Promise<Limi
 }
 
 async function fetchLiveOpenCodePayload(): Promise<LimitsPayload | null> {
-  const home = homedir()
-  const snapshotPath = join(home, ".opencode", "oc-codex-multi-auth-tui-quota-overview.json")
-  try {
-    const info = await stat(snapshotPath)
-    if (Date.now() - info.mtimeMs <= SNAPSHOT_MAX_AGE_MS) {
-      const raw = await readFile(snapshotPath, "utf-8")
-      const parsed = JSON.parse(raw) as LimitsPayload
-      if (parsed && Array.isArray(parsed.accounts) && parsed.accounts.length > 0) {
-        return parsed
-      }
-    }
-  } catch {
-    // 略過舊快照或不存在的快照
-  }
-
   const credentials = await discoverOpenCodeCredentials()
   for (const cred of credentials) {
     const payload = await fetchWhamUsageWithCredential(cred)
     if (payload) return payload
   }
-
   return null
 }
 
@@ -355,9 +452,23 @@ function extractActiveFiveHourLimit(payload: LimitsPayload): LimitEntry | null {
   const limits = active.limits
   if (!Array.isArray(limits)) return null
   for (const item of limits) {
-    if (item && Number(item.windowMinutes) === FIVE_HOURS_MINUTES) {
-      return item
+    if (!item || Number(item.windowMinutes) !== FIVE_HOURS_MINUTES) continue
+    const used = Number(item.usedPercent)
+    if (!Number.isFinite(used) || used < 0 || used > 100) continue
+    if (item.leftPercent !== undefined && item.leftPercent !== null) {
+      const left = Number(item.leftPercent)
+      if (
+        !Number.isFinite(left) ||
+        left < 0 ||
+        left > 100 ||
+        (used === 0 && left !== 100) ||
+        (left === 100 && used !== 0) ||
+        Math.abs(100 - used - left) > 0.51
+      ) {
+        return null
+      }
     }
+    return item
   }
   return null
 }
@@ -382,7 +493,7 @@ async function resolveScriptPath(): Promise<string | null> {
   return null
 }
 
-async function runPreheatThroughPython(payload: LimitsPayload | null): Promise<void> {
+async function runPreheatThroughPython(): Promise<void> {
   const scriptPath = await resolveScriptPath()
   if (!scriptPath) {
     await logLine("找不到 codex_preheater.py，略過本次預熱執行。")
@@ -390,10 +501,8 @@ async function runPreheatThroughPython(payload: LimitsPayload | null): Promise<v
   }
 
   const pythonCmd = process.platform === "win32" ? "python" : "python3"
+  // 不傳遞任何舊快照 JSON，強制由 Python 核心向即時 OAuth API 拉取最新額度並驗證
   const args = [scriptPath, "once", "--cli", "opencode", "--model", DEFAULT_MODEL]
-  if (payload) {
-    args.push("--opencode-limits-json", JSON.stringify(payload))
-  }
 
   await new Promise<void>((resolve) => {
     const child = spawn(pythonCmd, args, {
@@ -491,14 +600,13 @@ function startPreheaterDaemon(): { stop: () => void } {
       const payload = await fetchLiveOpenCodePayload()
       if (!payload) {
         await logLine(
-          `[${reason}] OpenCode 本地未直接讀到 OAuth 額度，交由 Python 預熱核心進行多來源檢查。`
+          `[${reason}] OpenCode 未能讀取當前即時 OAuth 額度，不執行預熱。`
         )
-        await runPreheatThroughPython(null)
         return
       }
       const fiveHour = extractActiveFiveHourLimit(payload)
       if (!fiveHour) {
-        await logLine(`[${reason}] 當前啟用帳號無 5 小時額度視窗（可能為 Free 方案），不觸發。`)
+        await logLine(`[${reason}] 當前啟用帳號無有效 5 小時額度視窗（可能為 Free 方案或額度資料異常），不觸發。`)
         return
       }
 
@@ -507,10 +615,10 @@ function startPreheaterDaemon(): { stop: () => void } {
       const resetAtMs = Number(fiveHour.resetAtMs ?? 0)
 
       if (used === 0 && left === 100) {
-        await logLine(`[${reason}] 偵測到 5 小時額度為 100% 剩餘（0% 已用），呼叫 Python 核心執行強制驗證與預熱！`)
+        await logLine(`[${reason}] 偵測到 5 小時額度為 100% 剩餘（0% 已用），呼叫 Python 核心執行即時強制驗證與預熱！`)
         clearResetTimers()
         scheduledResetAtMs = 0
-        await runPreheatThroughPython(payload)
+        await runPreheatThroughPython()
       } else {
         await logLine(`[${reason}] 當前 5 小時額度剩餘 ${left}%（已用 ${used}%），未達 100%，不發送預熱。`)
         if (resetAtMs > Date.now()) {

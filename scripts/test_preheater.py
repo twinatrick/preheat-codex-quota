@@ -113,6 +113,12 @@ class QuotaTests(unittest.TestCase):
     def test_opencode_free_plan_ignored(self):
         self.assertIsNone(m.find_opencode_five_hour_quota(opencode_payload(plan="free")))
 
+    def test_contradictory_opencode_quota_raises_error(self):
+        bad_payload = opencode_payload(used=35)
+        bad_payload["accounts"][0]["limits"][0]["leftPercent"] = 100
+        with self.assertRaises(m.PreheaterError):
+            m.find_opencode_five_hour_quota(bad_payload)
+
     def test_hard_code_guard_blocks_non_100_or_wrong_cli(self):
         bad_used = m.Quota(used_percent=1, duration_minutes=300, resets_at=2000000000, limit_id="codex", cli="opencode")
         with self.assertRaises(m.PreheaterError):
@@ -208,14 +214,77 @@ class TriggerTests(unittest.TestCase):
             self.assertEqual(m.check_once(args, now=1000000, env=self.opencode_env), "unknown-window")
             ping_oc.assert_not_called()
 
-    def test_opencode_auto_fallback_to_codex_limits_when_no_oauth_file(self):
+    def test_opencode_mode_never_falls_back_to_codex_limits(self):
         args = self.make_args(opencode_limits_json=None)
         with patch.object(m, "_discover_opencode_oauth_credentials", return_value=[]), \
              patch.object(m, "read_codex_limits", return_value=codex_payload(0)) as read_cx, \
              patch.object(m, "ping_opencode") as ping_oc:
+            with self.assertRaises(m.PreheaterError):
+                m.check_once(args, now=1000000, env=self.opencode_env)
+            read_cx.assert_not_called()
+            ping_oc.assert_not_called()
+
+    def test_opencode_post_ping_re_queries_quota(self):
+        args = self.make_args(opencode_limits_json=None)
+        q_before = m.Quota(used_percent=0, duration_minutes=300, resets_at=2000000000, limit_id="5h limit", cli="opencode")
+        q_after = m.Quota(used_percent=1, duration_minutes=300, resets_at=2000018000, limit_id="5h limit", cli="opencode")
+        with patch.object(m, "_read_active_quota", side_effect=[q_before, q_after]) as read_q, \
+             patch.object(m, "ping_opencode") as ping_oc:
             self.assertEqual(m.check_once(args, now=1000000, env=self.opencode_env), "sent")
-            read_cx.assert_called_once()
+            self.assertEqual(read_q.call_count, 2)
             ping_oc.assert_called_once()
+        state = m.load_state(self.path)
+        self.assertEqual(state["last_outcome"], "cli-success")
+        self.assertEqual(state["observed_resets_at"], 2000018000)
+
+    def test_persist_refreshed_oauth_credential_updates_multi_auth_and_native(self):
+        multi_path = Path(self.temp.name) / "multi.json"
+        multi_path.write_text(json.dumps({
+            "activeIndex": 0,
+            "accounts": [{"accessToken": "old-a", "refreshToken": "old-r", "expiresAt": 1000}],
+        }), encoding="utf-8")
+        cred_multi = {
+            "source_path": str(multi_path),
+            "source_kind": "multi_auth",
+            "account_index": 0,
+        }
+        m._persist_refreshed_oauth_credential(cred_multi, {
+            "access_token": "new-a",
+            "refresh_token": "new-r",
+            "expires_at_ms": 999999,
+        })
+        saved_multi = json.loads(multi_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_multi["accounts"][0]["accessToken"], "new-a")
+        self.assertEqual(saved_multi["accounts"][0]["refreshToken"], "new-r")
+        self.assertEqual(saved_multi["accounts"][0]["expiresAt"], 999999)
+
+        native_path = Path(self.temp.name) / "auth.json"
+        native_path.write_text(json.dumps({
+            "openai": {"type": "oauth", "access": "old-na", "refresh": "old-nr", "expires": 1000},
+        }), encoding="utf-8")
+        cred_native = {
+            "source_path": str(native_path),
+            "source_kind": "native_auth",
+        }
+        m._persist_refreshed_oauth_credential(cred_native, {
+            "access_token": "new-na",
+            "refresh_token": "new-nr",
+            "expires_at_ms": 888888,
+        })
+        saved_native = json.loads(native_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_native["openai"]["access"], "new-na")
+        self.assertEqual(saved_native["openai"]["refresh"], "new-nr")
+        self.assertEqual(saved_native["openai"]["expires"], 888888)
+
+    def test_resolve_opencode_model_falls_back_to_available_openai_model(self):
+        class FakeCompleted:
+            returncode = 0
+            stdout = "google/gemini-4-argon\nopenai/gpt-5.4-mini\nopenai/gpt-5.3-codex\n"
+            stderr = ""
+        with patch("shutil.which", return_value="opencode"), \
+             patch("subprocess.run", return_value=FakeCompleted()):
+            chosen = m.resolve_opencode_model("opencode", "openai/gpt-6-luna")
+            self.assertEqual(chosen, "openai/gpt-5.3-codex")
 
     def test_build_reset_check_schedule_returns_15s_and_45s(self):
         schedule = m.build_reset_check_schedule(1000, 990)

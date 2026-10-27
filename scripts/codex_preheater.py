@@ -35,7 +35,16 @@ import urllib.request
 
 PING = "Reply with exactly OK. Do not use tools, read files, or perform searches."
 FIVE_HOURS_MINUTES = 300
-VERSION = "1.3.0"
+VERSION = "1.4.0"
+DEFAULT_OPENCODE_MODEL = "openai/gpt-6-luna"
+PREFERRED_OPENCODE_MODELS = (
+    "openai/gpt-6-luna",
+    "openai/gpt-5.3-codex",
+    "openai/gpt-5.2-codex",
+    "openai/gpt-5.1-codex",
+    "openai/gpt-5-codex",
+    "openai/codex-mini-latest",
+)
 
 OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -308,7 +317,7 @@ def _extract_account_id_from_token(token: str) -> str | None:
     return None
 
 
-def _refresh_openai_oauth_token(refresh_token: str, timeout: int = 20) -> str | None:
+def _refresh_openai_oauth_token(refresh_token: str, timeout: int = 20) -> dict[str, Any] | None:
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -323,10 +332,112 @@ def _refresh_openai_oauth_token(refresh_token: str, timeout: int = 20) -> str | 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                return None
             access = data.get("access_token")
-            return access if isinstance(access, str) and access.strip() else None
+            if not isinstance(access, str) or not access.strip():
+                return None
+            new_refresh = data.get("refresh_token")
+            expires_in = data.get("expires_in")
+            expires_at_ms: int | None = None
+            if isinstance(expires_in, (int, float)) and expires_in > 0:
+                expires_at_ms = int(time.time() * 1000 + float(expires_in) * 1000)
+            return {
+                "access_token": access.strip(),
+                "refresh_token": (
+                    new_refresh.strip()
+                    if isinstance(new_refresh, str) and new_refresh.strip()
+                    else refresh_token
+                ),
+                "expires_at_ms": expires_at_ms,
+            }
     except Exception:
         return None
+
+
+def _persist_refreshed_oauth_credential(
+    cred: Mapping[str, Any],
+    refreshed: Mapping[str, Any],
+) -> None:
+    """Atomically persist rotated access/refresh tokens back to the credential file."""
+    source_path_raw = cred.get("source_path")
+    source_kind = cred.get("source_kind")
+    if not isinstance(source_path_raw, str) or not source_path_raw:
+        return
+    source_path = Path(source_path_raw)
+    if not source_path.is_file():
+        return
+
+    new_access = refreshed.get("access_token")
+    new_refresh = refreshed.get("refresh_token")
+    new_expires = refreshed.get("expires_at_ms")
+    if not isinstance(new_access, str) or not new_access:
+        return
+
+    try:
+        data = json.loads(source_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        updated = False
+        if source_kind == "multi_auth":
+            accounts = data.get("accounts")
+            idx = cred.get("account_index")
+            if isinstance(accounts, list) and isinstance(idx, int) and 0 <= idx < len(accounts):
+                acc = accounts[idx]
+                if isinstance(acc, dict):
+                    if "accessToken" in acc or "access" not in acc:
+                        acc["accessToken"] = new_access
+                    else:
+                        acc["access"] = new_access
+                    if isinstance(new_refresh, str) and new_refresh:
+                        if "refreshToken" in acc or "refresh" not in acc:
+                            acc["refreshToken"] = new_refresh
+                        else:
+                            acc["refresh"] = new_refresh
+                    if isinstance(new_expires, int) and new_expires > 0:
+                        if "expiresAt" in acc or "expires" not in acc:
+                            acc["expiresAt"] = new_expires
+                        else:
+                            acc["expires"] = new_expires
+                    updated = True
+        elif source_kind == "native_auth":
+            openai_entry = data.get("openai")
+            if isinstance(openai_entry, dict) and openai_entry.get("type") == "oauth":
+                if "access" in openai_entry or "accessToken" not in openai_entry:
+                    openai_entry["access"] = new_access
+                else:
+                    openai_entry["accessToken"] = new_access
+                if isinstance(new_refresh, str) and new_refresh:
+                    if "refresh" in openai_entry or "refreshToken" not in openai_entry:
+                        openai_entry["refresh"] = new_refresh
+                    else:
+                        openai_entry["refreshToken"] = new_refresh
+                if isinstance(new_expires, int) and new_expires > 0:
+                    if "expires" in openai_entry or "expiresAt" not in openai_entry:
+                        openai_entry["expires"] = new_expires
+                    else:
+                        openai_entry["expiresAt"] = new_expires
+                updated = True
+
+        if updated:
+            temp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    dir=source_path.parent,
+                    prefix=f".{source_path.name}.",
+                    suffix=".tmp",
+                    encoding="utf-8",
+                    delete=False,
+                ) as stream:
+                    temp_path = Path(stream.name)
+                    json.dump(data, stream, ensure_ascii=False, indent=2)
+                os.replace(temp_path, source_path)
+            finally:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink()
+    except Exception:
+        pass
 
 
 def _map_wham_window(window: Any, now_sec: float | None = None) -> dict[str, Any] | None:
@@ -377,13 +488,33 @@ def _fetch_wham_usage_as_opencode_payload(
     account_id: str | None = None,
     organization_id: str | None = None,
     timeout: int = 20,
+    credential_meta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     token = access_token
+    current_refresh = refresh_token
     now_ms = time.time() * 1000
-    if (not token or (isinstance(expires_at_ms, (int, float)) and 0 < expires_at_ms <= now_ms + 30_000)) and refresh_token:
-        refreshed = _refresh_openai_oauth_token(refresh_token, timeout=timeout)
-        if refreshed:
-            token = refreshed
+
+    def _apply_refresh(ref_tok: str) -> str | None:
+        nonlocal current_refresh
+        refreshed = _refresh_openai_oauth_token(ref_tok, timeout=timeout)
+        if isinstance(refreshed, str) and refreshed.strip():
+            refreshed = {"access_token": refreshed.strip(), "refresh_token": ref_tok, "expires_at_ms": None}
+        if not isinstance(refreshed, dict):
+            return None
+        new_access = refreshed.get("access_token")
+        if not isinstance(new_access, str) or not new_access.strip():
+            return None
+        new_ref = refreshed.get("refresh_token")
+        if isinstance(new_ref, str) and new_ref.strip():
+            current_refresh = new_ref.strip()
+        if credential_meta is not None:
+            _persist_refreshed_oauth_credential(credential_meta, refreshed)
+        return new_access.strip()
+
+    if (not token or (isinstance(expires_at_ms, (int, float)) and 0 < expires_at_ms <= now_ms + 30_000)) and current_refresh:
+        refreshed_access = _apply_refresh(current_refresh)
+        if refreshed_access:
+            token = refreshed_access
 
     if not token:
         return None
@@ -409,13 +540,13 @@ def _fetch_wham_usage_as_opencode_payload(
     try:
         raw_usage = _do_request(token)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and refresh_token:
-            refreshed = _refresh_openai_oauth_token(refresh_token, timeout=timeout)
-            if not refreshed:
+        if exc.code == 401 and current_refresh:
+            refreshed_access = _apply_refresh(current_refresh)
+            if not refreshed_access:
                 return None
-            resolved_account_id = account_id or _extract_account_id_from_token(refreshed)
+            resolved_account_id = account_id or _extract_account_id_from_token(refreshed_access)
             try:
-                raw_usage = _do_request(refreshed)
+                raw_usage = _do_request(refreshed_access)
             except Exception:
                 return None
         else:
@@ -486,6 +617,9 @@ def _discover_opencode_oauth_credentials() -> list[dict[str, Any]]:
                 "expires_at_ms": acc.get("expiresAt") or acc.get("expires"),
                 "account_id": acc.get("accountId"),
                 "organization_id": acc.get("organizationId"),
+                "source_path": str(path),
+                "source_kind": "multi_auth",
+                "account_index": active_idx,
             })
             break
 
@@ -513,6 +647,8 @@ def _discover_opencode_oauth_credentials() -> list[dict[str, Any]]:
                 "expires_at_ms": openai_entry.get("expires") or openai_entry.get("expiresAt"),
                 "account_id": openai_entry.get("accountId"),
                 "organization_id": openai_entry.get("organizationId"),
+                "source_path": str(path),
+                "source_kind": "native_auth",
             })
             break
 
@@ -548,6 +684,7 @@ def read_opencode_limits(
             account_id=cred.get("account_id"),
             organization_id=cred.get("organization_id"),
             timeout=timeout,
+            credential_meta=cred,
         )
         if payload is not None:
             return payload
@@ -595,10 +732,19 @@ def find_opencode_five_hour_quota(payload: dict[str, Any]) -> Quota | None:
         left = item.get("leftPercent")
         if left is not None:
             try:
-                if float(left) != 100.0 - used:
-                    used = 100.0 - float(left)
-            except (ValueError, TypeError):
-                pass
+                left_val = float(left)
+            except (ValueError, TypeError) as exc:
+                raise PreheaterError("OpenCode 額度資料中的 leftPercent 格式不正確，強制中止預熱。") from exc
+            if not (0.0 <= left_val <= 100.0):
+                raise PreheaterError("OpenCode 額度資料中的 leftPercent 超出有效範圍，強制中止預熱。")
+            if (
+                (used == 0.0 and left_val != 100.0)
+                or (left_val == 100.0 and used != 0.0)
+                or abs((100.0 - used) - left_val) > 0.51
+            ):
+                raise PreheaterError(
+                    f"OpenCode 額度資料矛盾（usedPercent={used}, leftPercent={left_val}），強制中止預熱。"
+                )
         reset_ms = item.get("resetAtMs")
         resets_at = int(float(reset_ms) // 1000) if isinstance(reset_ms, (int, float)) and reset_ms > 0 else 0
         not_started = bool(item.get("notStarted"))
@@ -671,18 +817,64 @@ def print_quota(quota: Quota, *, out: TextIO | None = None) -> None:
     print(f"顯示的下次刷新：{local_time(quota.resets_at, not_started=quota.not_started)}", file=target)
 
 
+def resolve_opencode_model(
+    binary: str,
+    requested_model: str = DEFAULT_OPENCODE_MODEL,
+    timeout: int = 15,
+) -> str:
+    """Resolve an available openai/* model from `opencode models`, falling back safely."""
+    if requested_model != "auto" and not requested_model.startswith("openai/"):
+        raise PreheaterError("為避免消耗錯誤服務商額度，--model 必須為 auto 或以 openai/ 開頭。")
+
+    fallback = DEFAULT_OPENCODE_MODEL if requested_model == "auto" else requested_model
+    resolved_binary = shutil.which(binary)
+    if resolved_binary is None:
+        return fallback
+
+    try:
+        result = subprocess.run(
+            [resolved_binary, "models"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            return fallback
+        available = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().startswith("openai/")
+        ]
+        if not available:
+            return fallback
+        if requested_model != "auto" and requested_model in available:
+            return requested_model
+        for preferred in PREFERRED_OPENCODE_MODELS:
+            if preferred in available:
+                return preferred
+        return available[0]
+    except Exception:
+        return fallback
+
+
 def ping_opencode(binary: str, model: str, timeout: int, *, quota: Quota) -> None:
     _assert_quota_eligible(quota, expected_cli="opencode")
     resolved_binary = shutil.which(binary)
     if resolved_binary is None:
         raise PreheaterError(f"找不到 OpenCode：{binary}。請先安裝並登入 ChatGPT。")
+    effective_model = resolve_opencode_model(binary, model, timeout=min(15, max(5, timeout)))
     with tempfile.TemporaryDirectory(prefix="codex-preheater-") as directory:
         env = os.environ.copy()
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
         env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
         try:
             result = subprocess.run(
-                [resolved_binary, "run", "--model", model, "--format", "json", PING],
+                [resolved_binary, "run", "--model", effective_model, "--format", "json", PING],
                 cwd=directory, env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace", timeout=timeout,
@@ -747,19 +939,12 @@ def _read_active_quota(args: argparse.Namespace, active_cli: str) -> Quota | Non
     if active_cli == "opencode":
         limits_json = getattr(args, "opencode_limits_json", None)
         limits_file = getattr(args, "opencode_limits_file", None)
-        try:
-            payload = read_opencode_limits(
-                limits_json,
-                limits_file,
-                timeout=getattr(args, "rpc_timeout", 20),
-            )
-            return find_opencode_five_hour_quota(payload)
-        except PreheaterError:
-            if limits_json or limits_file:
-                raise
-            # Fallback to codex app-server if user uses shared Codex login without OpenCode OAuth file
-            payload = read_codex_limits(args.codex_bin, args.rpc_timeout)
-            return find_five_hour_quota(payload, cli="opencode")
+        payload = read_opencode_limits(
+            limits_json,
+            limits_file,
+            timeout=getattr(args, "rpc_timeout", 20),
+        )
+        return find_opencode_five_hour_quota(payload)
     payload = read_codex_limits(args.codex_bin, args.rpc_timeout)
     return find_five_hour_quota(payload, cli="codex")
 
@@ -843,17 +1028,22 @@ def check_once(
         })
 
     print(f"{active_cli} 預熱請求完成。", file=target_out)
-    if active_cli == "codex":
-        try:
-            after = find_five_hour_quota(read_codex_limits(args.codex_bin, args.rpc_timeout))
-            if after:
-                print_quota(after, out=target_out)
-                if after.used_percent == 0:
-                    print("仍顯示 100% 剩餘：可能是計量延遲或四捨五入；不會自動重送。", file=target_out)
-                else:
-                    print("已看到使用量增加。刷新時刻請以帳號的最新顯示為準。", file=target_out)
-        except PreheaterError as exc:
-            print(f"事後查詢額度失敗：{exc}。已禁止自動重送。", file=target_out)
+    try:
+        after = _read_active_quota(args, active_cli)
+        if after:
+            print_quota(after, out=target_out)
+            if after.resets_at and after.resets_at != observed_reset:
+                with state_lock(state_file):
+                    latest_state = load_state(state_file)
+                    if latest_state:
+                        latest_state["observed_resets_at"] = after.resets_at
+                        save_state(state_file, latest_state)
+            if after.used_percent == 0:
+                print("仍顯示 100% 剩餘：可能是計量延遲或四捨五入；不會自動重送。", file=target_out)
+            else:
+                print("已看到使用量增加。刷新時刻請以帳號的最新顯示為準。", file=target_out)
+    except PreheaterError as exc:
+        print(f"事後查詢額度失敗：{exc}。已禁止自動重送。", file=target_out)
     return "sent"
 
 
@@ -966,7 +1156,11 @@ def main(argv: list[str] | None = None) -> int:
         help="查詢當前介面額度 / 檢查並預熱一次 / 作為 Codex MCP Server 掛載",
     )
     parser.add_argument("--cli", choices=("auto", "opencode", "codex"), default="auto", help="限定當前介面（預設 auto 自動偵測）")
-    parser.add_argument("--model", default="openai/gpt-6-luna", help="OpenCode 介面使用的 model ID")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_OPENCODE_MODEL,
+        help="OpenCode 介面使用的 model ID（可設為 auto 自動挑選 openai/* 模型）",
+    )
     parser.add_argument("--codex-model", default=None, help="Codex CLI 介面使用的 model（選填）")
     parser.add_argument("--codex-bin", default="codex", help="Codex CLI 執行檔名稱（由 PATH 解析）")
     parser.add_argument("--opencode-bin", default="opencode", help="OpenCode CLI 執行檔名稱（由 PATH 解析）")
@@ -981,8 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.min_gap_minutes < 0 or args.rpc_timeout < 1 or args.ping_timeout < 1:
         parser.error("min-gap 不可為負；timeout 必須大於 0。")
-    if not args.model.startswith("openai/"):
-        parser.error("為避免消耗錯誤服務商額度，--model 必須以 openai/ 開頭。")
+    if args.model != "auto" and not args.model.startswith("openai/"):
+        parser.error("為避免消耗錯誤服務商額度，--model 必須為 auto 或以 openai/ 開頭。")
 
     if args.command == "mcp-server":
         return run_mcp_server(args)
