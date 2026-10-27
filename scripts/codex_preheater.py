@@ -5,15 +5,18 @@
 - When invoked from Codex CLI / MCP Server: checks Codex 5h quota via `codex app-server` and pings via `codex exec`.
 - When neither CLI is active: refuses to run.
 - Enforces 5-hour 100% remaining (0% used) check in code before any preheat request can be sent.
-- Supports `mcp-server` mode for Codex CLI: mounts when Codex starts, checks at HH:01:00 and within 1 minute after reset.
+- Supports `mcp-server` mode for Codex CLI: mounts when Codex starts, checks at HH:01:00 and within 1 minute after reset,
+  and strictly isolates `sys.stdout` for MCP JSON-RPC frames while writing background logs to `server.log`.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import io
 import json
 import os
 from pathlib import Path
@@ -24,12 +27,20 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 PING = "Reply with exactly OK. Do not use tools, read files, or perform searches."
 FIVE_HOURS_MINUTES = 300
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+CHATGPT_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+JWT_AUTH_CLAIM = "https://api.openai.com/auth"
 
 OPENCODE_ENV_KEYS = (
     "OPENCODE",
@@ -124,6 +135,33 @@ def local_time(timestamp: int, *, not_started: bool = False) -> str:
     return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
+def default_state_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+    return base / "codex-preheater"
+
+
+def default_state_file() -> Path:
+    return default_state_dir() / "state.json"
+
+
+def default_log_file() -> Path:
+    return default_state_dir() / "server.log"
+
+
+def log_daemon(source: str, message: str) -> None:
+    try:
+        log_path = default_log_file()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{ts}] [{source}] {message}\n")
+    except Exception:
+        pass
+
+
 def _rpc_read_loop(stdout: Any, responses: queue.Queue) -> None:
     try:
         for line in stdout:
@@ -213,7 +251,7 @@ def read_codex_limits(binary: str, timeout: int = 30) -> dict[str, Any]:
             proc.stdout.close()
 
 
-def find_five_hour_quota(payload: dict[str, Any]) -> Quota | None:
+def find_five_hour_quota(payload: dict[str, Any], *, cli: str = "codex") -> Quota | None:
     """Choose only the main Codex 300-minute bucket, not weekly/other quotas."""
     buckets = payload.get("rateLimitsByLimitId")
     main = buckets.get("codex") if isinstance(buckets, dict) else None
@@ -237,33 +275,286 @@ def find_five_hour_quota(payload: dict[str, Any]) -> Quota | None:
                 duration_minutes=duration,
                 resets_at=reset,
                 limit_id="codex",
-                cli="codex",
+                cli=cli,
             )
     return None
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload_b64 = parts[1].replace("-", "+").replace("_", "/")
+        padded = payload_b64 + "=" * ((4 - len(payload_b64) % 4) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8")
+        obj = json.loads(decoded)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_account_id_from_token(token: str) -> str | None:
+    payload = _decode_jwt_payload(token)
+    auth_claim = payload.get(JWT_AUTH_CLAIM)
+    if isinstance(auth_claim, dict):
+        cid = auth_claim.get("chatgpt_account_id")
+        if isinstance(cid, str) and cid.strip():
+            return cid.strip()
+    for key in ("chatgpt_account_id", "account_id", "accountId"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _refresh_openai_oauth_token(refresh_token: str, timeout: int = 20) -> str | None:
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OPENAI_OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OPENAI_OAUTH_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            access = data.get("access_token")
+            return access if isinstance(access, str) and access.strip() else None
+    except Exception:
+        return None
+
+
+def _map_wham_window(window: Any, now_sec: float | None = None) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+    length_sec = window.get("limit_window_seconds")
+    used = window.get("used_percent")
+    if not isinstance(length_sec, (int, float)) or length_sec <= 0:
+        return None
+    if not isinstance(used, (int, float)):
+        return None
+    window_minutes = max(1, int((float(length_sec) + 59) // 60))
+    now_val = time.time() if now_sec is None else now_sec
+    reset_after = window.get("reset_after_seconds")
+    reset_at = window.get("reset_at")
+    remaining_sec: float | None = None
+    if isinstance(reset_after, (int, float)):
+        remaining_sec = float(reset_after)
+    elif isinstance(reset_at, (int, float)):
+        remaining_sec = float(reset_at) - now_val
+
+    not_started = bool(
+        float(used) == 0.0
+        and remaining_sec is not None
+        and remaining_sec >= float(length_sec) - 1.0
+    )
+    reset_at_ms: int | None = None
+    if not not_started:
+        if isinstance(reset_at, (int, float)) and reset_at > 0:
+            reset_at_ms = int(float(reset_at) * 1000)
+        elif isinstance(reset_after, (int, float)) and reset_after > 0:
+            reset_at_ms = int((now_val + float(reset_after)) * 1000)
+
+    return {
+        "name": "5h limit" if window_minutes == 300 else f"{window_minutes}m limit",
+        "windowMinutes": window_minutes,
+        "usedPercent": float(used),
+        "leftPercent": max(0.0, min(100.0, round(100.0 - float(used)))),
+        "resetAtMs": reset_at_ms,
+        "notStarted": not_started,
+    }
+
+
+def _fetch_wham_usage_as_opencode_payload(
+    access_token: str,
+    refresh_token: str | None = None,
+    expires_at_ms: int | float | None = None,
+    account_id: str | None = None,
+    organization_id: str | None = None,
+    timeout: int = 20,
+) -> dict[str, Any] | None:
+    token = access_token
+    now_ms = time.time() * 1000
+    if (not token or (isinstance(expires_at_ms, (int, float)) and 0 < expires_at_ms <= now_ms + 30_000)) and refresh_token:
+        refreshed = _refresh_openai_oauth_token(refresh_token, timeout=timeout)
+        if refreshed:
+            token = refreshed
+
+    if not token:
+        return None
+
+    resolved_account_id = account_id or _extract_account_id_from_token(token)
+
+    def _do_request(bearer: str) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {bearer}",
+            "Accept": "application/json",
+            "OpenAI-Beta": "responses=experimental",
+            "originator": "codex_cli_rs",
+            "User-Agent": "codex_cli_rs/0.1.0",
+        }
+        if resolved_account_id:
+            headers["chatgpt-account-id"] = resolved_account_id
+        if organization_id:
+            headers["openai-organization"] = organization_id
+        req = urllib.request.Request(CHATGPT_WHAM_USAGE_URL, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        raw_usage = _do_request(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and refresh_token:
+            refreshed = _refresh_openai_oauth_token(refresh_token, timeout=timeout)
+            if not refreshed:
+                return None
+            resolved_account_id = account_id or _extract_account_id_from_token(refreshed)
+            try:
+                raw_usage = _do_request(refreshed)
+            except Exception:
+                return None
+        else:
+            return None
+    except Exception:
+        return None
+
+    if not isinstance(raw_usage, dict):
+        return None
+
+    rate_limit = raw_usage.get("rate_limit")
+    limits: list[dict[str, Any]] = []
+    if isinstance(rate_limit, dict):
+        for key in ("primary_window", "secondary_window"):
+            mapped = _map_wham_window(rate_limit.get(key))
+            if mapped is not None:
+                limits.append(mapped)
+
+    return {
+        "totalAccounts": 1,
+        "activeIndex": 1,
+        "accounts": [
+            {
+                "index": 1,
+                "isActive": True,
+                "planType": raw_usage.get("plan_type"),
+                "limits": limits,
+            }
+        ],
+    }
+
+
+def _discover_opencode_oauth_credentials() -> list[dict[str, Any]]:
+    """Discover active OpenCode OpenAI OAuth credentials across native auth.json and multi-auth files."""
+    home = Path.home()
+    candidates: list[dict[str, Any]] = []
+
+    # 1. Multi-auth account files (if user uses oc-codex-multi-auth)
+    multi_auth_paths = [
+        home / ".opencode" / "oc-codex-multi-auth-accounts.json",
+        home / ".opencode" / "openai-codex-accounts.json",
+        home / ".config" / "opencode" / "oc-codex-multi-auth-accounts.json",
+    ]
+    for path in multi_auth_paths:
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        accounts = data.get("accounts")
+        if not isinstance(accounts, list) or not accounts:
+            continue
+        by_family = data.get("activeIndexByFamily")
+        raw_active = (
+            by_family.get("codex")
+            if isinstance(by_family, dict) and isinstance(by_family.get("codex"), int)
+            else data.get("activeIndex", 0)
+        )
+        active_idx = raw_active if isinstance(raw_active, int) and 0 <= raw_active < len(accounts) else 0
+        acc = accounts[active_idx]
+        if isinstance(acc, dict) and acc.get("enabled") is not False:
+            candidates.append({
+                "access_token": str(acc.get("accessToken") or acc.get("access") or ""),
+                "refresh_token": str(acc.get("refreshToken") or acc.get("refresh") or ""),
+                "expires_at_ms": acc.get("expiresAt") or acc.get("expires"),
+                "account_id": acc.get("accountId"),
+                "organization_id": acc.get("organizationId"),
+            })
+            break
+
+    # 2. Native OpenCode auth.json (`~/.local/share/opencode/auth.json` or XDG_DATA_HOME)
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    native_auth_paths = [
+        Path(xdg_data) / "opencode" / "auth.json" if xdg_data else None,
+        home / ".local" / "share" / "opencode" / "auth.json",
+        Path(os.environ.get("LOCALAPPDATA", str(home))) / "opencode" / "auth.json",
+    ]
+    for path in native_auth_paths:
+        if path is None or not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        openai_entry = data.get("openai")
+        if isinstance(openai_entry, dict) and openai_entry.get("type") == "oauth":
+            candidates.append({
+                "access_token": str(openai_entry.get("access") or openai_entry.get("accessToken") or ""),
+                "refresh_token": str(openai_entry.get("refresh") or openai_entry.get("refreshToken") or ""),
+                "expires_at_ms": openai_entry.get("expires") or openai_entry.get("expiresAt"),
+                "account_id": openai_entry.get("accountId"),
+                "organization_id": openai_entry.get("organizationId"),
+            })
+            break
+
+    return candidates
 
 
 def read_opencode_limits(
     limits_json: str | None = None,
     limits_file: str | None = None,
+    timeout: int = 20,
 ) -> dict[str, Any]:
-    """Parse OpenCode `codex-limits` JSON payload without touching credential files."""
+    """Read OpenCode active account limits from JSON/file or auto-discover from OpenCode OAuth."""
     raw = limits_json
     if not raw and limits_file:
         try:
             raw = Path(limits_file).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             raise PreheaterError(f"無法讀取 OpenCode 額度檔案 {limits_file}：{exc}") from exc
-    if not raw:
-        raise PreheaterError(
-            "OpenCode 介面下必須先提供當前額度資料（請由 OpenCode 呼叫 codex-limits 取得 JSON 後透過 --opencode-limits-json 傳入），未檢查額度前禁止預熱。"
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PreheaterError(f"OpenCode 額度 JSON 格式不正確：{exc}") from exc
+        if not isinstance(data, dict):
+            raise PreheaterError("OpenCode 額度資料必須為 JSON 物件。")
+        return data
+
+    for cred in _discover_opencode_oauth_credentials():
+        payload = _fetch_wham_usage_as_opencode_payload(
+            access_token=cred["access_token"],
+            refresh_token=cred.get("refresh_token"),
+            expires_at_ms=cred.get("expires_at_ms"),
+            account_id=cred.get("account_id"),
+            organization_id=cred.get("organization_id"),
+            timeout=timeout,
         )
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PreheaterError(f"OpenCode 額度 JSON 格式不正確：{exc}") from exc
-    if not isinstance(data, dict):
-        raise PreheaterError("OpenCode 額度資料必須為 JSON 物件。")
-    return data
+        if payload is not None:
+            return payload
+
+    raise PreheaterError(
+        "OpenCode 介面下無法讀取當前額度資料（未找到 OpenCode OpenAI OAuth 憑證或額度 JSON），未檢查額度前禁止預熱。"
+    )
 
 
 def find_opencode_five_hour_quota(payload: dict[str, Any]) -> Quota | None:
@@ -322,14 +613,6 @@ def find_opencode_five_hour_quota(payload: dict[str, Any]) -> Quota | None:
     return None
 
 
-def default_state_file() -> Path:
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
-    return base / "codex-preheater" / "state.json"
-
-
 @contextmanager
 def state_lock(state_path: Path) -> Iterator[None]:
     """Cross-platform advisory lock to prevent duplicate pings from two instances."""
@@ -381,10 +664,11 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
             temp_path.unlink()
 
 
-def print_quota(quota: Quota) -> None:
-    print(f"當前介面：{quota.cli}")
-    print(f"五小時額度：剩餘 {quota.remaining_percent:.2f}%（已用 {quota.used_percent:.2f}%）")
-    print(f"顯示的下次刷新：{local_time(quota.resets_at, not_started=quota.not_started)}")
+def print_quota(quota: Quota, *, out: TextIO | None = None) -> None:
+    target = sys.stdout if out is None else out
+    print(f"當前介面：{quota.cli}", file=target)
+    print(f"五小時額度：剩餘 {quota.remaining_percent:.2f}%（已用 {quota.used_percent:.2f}%）", file=target)
+    print(f"顯示的下次刷新：{local_time(quota.resets_at, not_started=quota.not_started)}", file=target)
 
 
 def ping_opencode(binary: str, model: str, timeout: int, *, quota: Quota) -> None:
@@ -461,13 +745,23 @@ def ping_codex(binary: str, model: str | None, timeout: int, *, quota: Quota) ->
 
 def _read_active_quota(args: argparse.Namespace, active_cli: str) -> Quota | None:
     if active_cli == "opencode":
-        payload = read_opencode_limits(
-            getattr(args, "opencode_limits_json", None),
-            getattr(args, "opencode_limits_file", None),
-        )
-        return find_opencode_five_hour_quota(payload)
+        limits_json = getattr(args, "opencode_limits_json", None)
+        limits_file = getattr(args, "opencode_limits_file", None)
+        try:
+            payload = read_opencode_limits(
+                limits_json,
+                limits_file,
+                timeout=getattr(args, "rpc_timeout", 20),
+            )
+            return find_opencode_five_hour_quota(payload)
+        except PreheaterError:
+            if limits_json or limits_file:
+                raise
+            # Fallback to codex app-server if user uses shared Codex login without OpenCode OAuth file
+            payload = read_codex_limits(args.codex_bin, args.rpc_timeout)
+            return find_five_hour_quota(payload, cli="opencode")
     payload = read_codex_limits(args.codex_bin, args.rpc_timeout)
-    return find_five_hour_quota(payload)
+    return find_five_hour_quota(payload, cli="codex")
 
 
 def check_once(
@@ -475,18 +769,23 @@ def check_once(
     *,
     now: float | None = None,
     env: Mapping[str, str] | None = None,
+    out: TextIO | None = None,
 ) -> str:
+    target_out = sys.stdout if out is None else out
     active_cli = detect_active_cli(env, getattr(args, "cli", "auto"))
     quota = _read_active_quota(args, active_cli)
     if quota is None:
-        print(f"目前在 {active_cli} 讀不到當前帳號的五小時額度（可能為 Free 方案或缺少 5 小時視窗），不發送預熱請求。")
+        print(
+            f"目前在 {active_cli} 讀不到當前帳號的五小時額度（可能為 Free 方案或缺少 5 小時視窗），不發送預熱請求。",
+            file=target_out,
+        )
         return "not-applicable"
-    print_quota(quota)
+    print_quota(quota, out=target_out)
     if quota.used_percent != 0 or quota.remaining_percent != 100:
-        print("已有使用量（剩餘不等於 100%），強制攔截，不發送預熱請求。")
+        print("已有使用量（剩餘不等於 100%），強制攔截，不發送預熱請求。", file=target_out)
         return "not-full"
     if not quota.resets_at and not quota.not_started:
-        print("沒有可辨識的刷新時間，為避免重複消耗，本次不發送。")
+        print("沒有可辨識的刷新時間，為避免重複消耗，本次不發送。", file=target_out)
         return "unknown-window"
 
     state_file = Path(args.state_file).expanduser()
@@ -498,16 +797,19 @@ def check_once(
         gap_seconds = max(0, int(args.min_gap_minutes)) * 60
         if last_attempt and current - last_attempt < gap_seconds:
             left = int((gap_seconds - (current - last_attempt)) / 60) + 1
-            print(f"防重複保護：距上次嘗試不足 {args.min_gap_minutes} 分鐘，約 {left} 分鐘後才會再次允許。")
+            print(
+                f"防重複保護：距上次嘗試不足 {args.min_gap_minutes} 分鐘，約 {left} 分鐘後才會再次允許。",
+                file=target_out,
+            )
             return "cooldown"
         if quota.resets_at and last_reset == quota.resets_at and last_attempt:
-            print("這個刷新視窗已經嘗試預熱過，不再重複發送。")
+            print("這個刷新視窗已經嘗試預熱過，不再重複發送。", file=target_out)
             return "duplicate-window"
 
         target_desc = f"OpenCode ({args.model})" if active_cli == "opencode" else "Codex CLI"
-        print(f"符合條件：剩餘 100%。準備僅針對當前介面 {target_desc} 發送極小請求。")
+        print(f"符合條件：剩餘 100%。準備僅針對當前介面 {target_desc} 發送極小請求。", file=target_out)
         if args.dry_run:
-            print("演練模式：未發出請求，未修改防重複紀錄。")
+            print("演練模式：未發出請求，未修改防重複紀錄。", file=target_out)
             return "dry-run"
 
         observed_reset = quota.resets_at or int(current) + FIVE_HOURS_MINUTES * 60
@@ -540,27 +842,36 @@ def check_once(
             "last_outcome": "cli-success",
         })
 
-    print(f"{active_cli} 預熱請求完成。")
+    print(f"{active_cli} 預熱請求完成。", file=target_out)
     if active_cli == "codex":
         try:
             after = find_five_hour_quota(read_codex_limits(args.codex_bin, args.rpc_timeout))
             if after:
-                print_quota(after)
+                print_quota(after, out=target_out)
                 if after.used_percent == 0:
-                    print("仍顯示 100% 剩餘：可能是計量延遲或四捨五入；不會自動重送。")
+                    print("仍顯示 100% 剩餘：可能是計量延遲或四捨五入；不會自動重送。", file=target_out)
                 else:
-                    print("已看到使用量增加。刷新時刻請以帳號的最新顯示為準。")
+                    print("已看到使用量增加。刷新時刻請以帳號的最新顯示為準。", file=target_out)
         except PreheaterError as exc:
-            print(f"事後查詢額度失敗：{exc}。已禁止自動重送。")
+            print(f"事後查詢額度失敗：{exc}。已禁止自動重送。", file=target_out)
     return "sent"
 
 
+def build_reset_check_schedule(resets_at: int, now_ts: float) -> list[float]:
+    """Return remaining post-reset check timestamps (+15s and +45s) strictly in the future."""
+    if not resets_at or resets_at <= 0:
+        return []
+    return [ts for ts in (float(resets_at) + 15.0, float(resets_at) + 45.0) if ts > now_ts]
+
+
 def _run_codex_background_scheduler(args: argparse.Namespace) -> None:
-    """Background scheduler for Codex MCP server: checks at startup, HH:01:00, and resetAt + 15s/+45s."""
+    """Background scheduler for Codex MCP server: never writes to stdout; logs to server.log."""
     env = dict(os.environ)
     env["CODEX_MCP_SERVER"] = "1"
-    next_reset_check_ts: float | None = None
-    retry_45_for_reset: int | None = None
+    scheduled_reset_at: int | None = None
+    pending_reset_checks: list[float] = []
+
+    log_daemon("codex-mcp", "Codex MCP 預熱守衛已掛載於背景。")
 
     while True:
         now = time.time()
@@ -568,30 +879,50 @@ def _run_codex_background_scheduler(args: argparse.Namespace) -> None:
             quota = find_five_hour_quota(read_codex_limits(args.codex_bin, args.rpc_timeout))
             if quota is not None:
                 if quota.used_percent == 0 and quota.remaining_percent == 100:
-                    check_once(args, now=now, env=env)
-                    next_reset_check_ts = None
-                    retry_45_for_reset = None
+                    buf = io.StringIO()
+                    outcome = check_once(args, now=now, env=env, out=buf)
+                    summary = " | ".join(line.strip() for line in buf.getvalue().splitlines() if line.strip())
+                    log_daemon("codex-mcp", f"檢查結果 ({outcome}): {summary}")
+                    scheduled_reset_at = None
+                    pending_reset_checks.clear()
                 elif quota.resets_at > now:
-                    if retry_45_for_reset == quota.resets_at:
-                        next_reset_check_ts = quota.resets_at + 45.0
-                        retry_45_for_reset = None
-                    else:
-                        next_reset_check_ts = quota.resets_at + 15.0
-                        retry_45_for_reset = quota.resets_at
-        except Exception:
-            pass
+                    if scheduled_reset_at != quota.resets_at:
+                        scheduled_reset_at = quota.resets_at
+                        pending_reset_checks = build_reset_check_schedule(quota.resets_at, now)
+                        log_daemon(
+                            "codex-mcp",
+                            f"額度未滿（已用 {quota.used_percent:.0f}%），已排程刷新後 +15s 與 +45s 自動檢查。",
+                        )
+        except Exception as exc:
+            log_daemon("codex-mcp", f"背景檢查異常：{exc}")
 
         now = time.time()
+        pending_reset_checks = [ts for ts in pending_reset_checks if ts > now]
         sleep_secs = seconds_until_next_hour_plus_one_minute(now)
-        if next_reset_check_ts is not None and next_reset_check_ts > now:
-            sleep_secs = min(sleep_secs, max(1.0, next_reset_check_ts - now))
+        if pending_reset_checks:
+            sleep_secs = min(sleep_secs, max(1.0, pending_reset_checks[0] - now))
         time.sleep(sleep_secs)
 
 
-def run_mcp_server(args: argparse.Namespace) -> int:
-    """Minimal stdio MCP server mounted by Codex CLI on startup; stops when Codex exits."""
-    threading.Thread(target=_run_codex_background_scheduler, args=(args,), daemon=True).start()
-    for raw_line in sys.stdin:
+def run_mcp_server(
+    args: argparse.Namespace,
+    *,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    start_scheduler: bool = True,
+) -> int:
+    """Minimal stdio MCP server mounted by Codex CLI on startup; isolates stdout strictly for JSON-RPC."""
+    mcp_stdin = sys.stdin if stdin is None else stdin
+    mcp_stdout = sys.stdout if stdout is None else stdout
+
+    # Redirect global sys.stdout to sys.stderr when running over real stdio so no stray print() corrupts MCP frames
+    if stdout is None:
+        sys.stdout = sys.stderr
+
+    if start_scheduler:
+        threading.Thread(target=_run_codex_background_scheduler, args=(args,), daemon=True).start()
+
+    for raw_line in mcp_stdin:
         line = raw_line.strip()
         if not line:
             continue
@@ -613,8 +944,8 @@ def run_mcp_server(args: argparse.Namespace) -> int:
             result = {"tools": []}
         else:
             result = {}
-        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
-        sys.stdout.flush()
+        mcp_stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
+        mcp_stdout.flush()
     return 0
 
 
@@ -639,8 +970,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--codex-model", default=None, help="Codex CLI 介面使用的 model（選填）")
     parser.add_argument("--codex-bin", default="codex", help="Codex CLI 執行檔名稱（由 PATH 解析）")
     parser.add_argument("--opencode-bin", default="opencode", help="OpenCode CLI 執行檔名稱（由 PATH 解析）")
-    parser.add_argument("--opencode-limits-json", default=None, help="OpenCode codex-limits 工具輸出的 JSON 字串")
-    parser.add_argument("--opencode-limits-file", default=None, help="OpenCode codex-limits 工具輸出的 JSON 檔案路徑")
+    parser.add_argument("--opencode-limits-json", default=None, help="OpenCode codex-limits 工具輸出的 JSON 字串（選填，預設自動探索）")
+    parser.add_argument("--opencode-limits-file", default=None, help="OpenCode codex-limits 工具輸出的 JSON 檔案路徑（選填）")
     parser.add_argument("--state-file", default=str(default_state_file()), help="防重複紀錄位置")
     parser.add_argument("--min-gap-minutes", type=int, default=280, help="兩次預熱嘗試至少間隔幾分鐘（預設 280）")
     parser.add_argument("--rpc-timeout", type=int, default=30, help="額度查詢逾時秒數")

@@ -208,6 +208,52 @@ class TriggerTests(unittest.TestCase):
             self.assertEqual(m.check_once(args, now=1000000, env=self.opencode_env), "unknown-window")
             ping_oc.assert_not_called()
 
+    def test_opencode_auto_fallback_to_codex_limits_when_no_oauth_file(self):
+        args = self.make_args(opencode_limits_json=None)
+        with patch.object(m, "_discover_opencode_oauth_credentials", return_value=[]), \
+             patch.object(m, "read_codex_limits", return_value=codex_payload(0)) as read_cx, \
+             patch.object(m, "ping_opencode") as ping_oc:
+            self.assertEqual(m.check_once(args, now=1000000, env=self.opencode_env), "sent")
+            read_cx.assert_called_once()
+            ping_oc.assert_called_once()
+
+    def test_build_reset_check_schedule_returns_15s_and_45s(self):
+        schedule = m.build_reset_check_schedule(1000, 990)
+        self.assertEqual(schedule, [1015.0, 1045.0])
+        schedule_after_15 = m.build_reset_check_schedule(1000, 1020)
+        self.assertEqual(schedule_after_15, [1045.0])
+        self.assertEqual(m.build_reset_check_schedule(1000, 1050), [])
+
+    def test_mcp_server_isolates_stdout_for_jsonrpc_only(self):
+        import io
+        args = self.make_args()
+        fake_in = io.StringIO(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n"
+        )
+        fake_out = io.StringIO()
+        rc = m.run_mcp_server(args, stdin=fake_in, stdout=fake_out, start_scheduler=False)
+        self.assertEqual(rc, 0)
+        lines = [line for line in fake_out.getvalue().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 2)
+        msg1 = json.loads(lines[0])
+        msg2 = json.loads(lines[1])
+        self.assertEqual(msg1["id"], 1)
+        self.assertEqual(msg1["result"]["serverInfo"]["name"], "codex-preheater")
+        self.assertEqual(msg2["id"], 2)
+        self.assertEqual(msg2["result"]["tools"], [])
+
+    def test_map_wham_window_converts_5h_window(self):
+        mapped = m._map_wham_window(
+            {"limit_window_seconds": 18000, "used_percent": 0, "reset_at": 2000000000},
+            now_sec=1999990000,
+        )
+        self.assertIsNotNone(mapped)
+        self.assertEqual(mapped["windowMinutes"], 300)
+        self.assertEqual(mapped["usedPercent"], 0.0)
+        self.assertEqual(mapped["leftPercent"], 100)
+        self.assertEqual(mapped["resetAtMs"], 2000000000000)
+
 
 if __name__ == "__main__":
     unittest.main()

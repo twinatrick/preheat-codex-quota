@@ -40,8 +40,8 @@ preheat-codex-quota/
 ├── plugins/
 │   └── codex-preheater.ts         # OpenCode Server 自動掛載插件
 └── scripts/
-    ├── codex_preheater.py         # 核心預熱與額度檢查腳本（含 Codex MCP Server 模式）
-    └── test_preheater.py          # 18 項自動化單元測試
+    ├── codex_preheater.py         # 核心預熱與額度檢查腳本（含 Codex MCP Server 模式與多來源 OAuth 自動探索）
+    └── test_preheater.py          # 22 項自動化單元測試
 ```
 
 ---
@@ -85,12 +85,12 @@ args = ["C:/Users/<你的使用者名稱>/.agents/skills/preheat-codex-quota/scr
 ## 手動測試與單元測試指令
 
 ```powershell
-# 執行 18 項單元測試
+# 執行 22 項單元測試
 python -m unittest -v scripts/test_preheater.py
 
-# 在 OpenCode 環境手動演練檢查（不實際發送）
-python scripts/codex_preheater.py once --dry-run --opencode-limits-file <limits.json>
-
-# 在 Codex CLI 環境手動檢查狀態
+# 在當前 CLI 環境（OpenCode 或 Codex）直接檢查目前 5 小時額度狀態
 python scripts/codex_preheater.py status
+
+# 在當前 CLI 環境手動演練檢查（不實際發送）
+python scripts/codex_preheater.py once --dry-run
 ```
